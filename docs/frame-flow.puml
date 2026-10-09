@@ -1,0 +1,85 @@
+' Sequence of one frame through the pipeline, from vcan0 to stdout (grader mode).
+@startuml DeepSea_Frame_Flow
+!theme plain
+autonumber
+title One frame through the pipeline (grader mode)
+
+participant "vcan0" as BUS
+participant "SocketCanInterface" as COMM
+participant "CanTransport" as TR
+participant "SegmentedReassembler" as RA
+participant "ApplicationController" as APP
+participant "RootRouter" as ROOT
+participant "SubRouter" as SUB
+participant "ControllerRoute" as ROUTE
+participant "decode_*()" as DEC
+participant "Domain Controller" as CTRL
+participant "ApplicationState" as STATE
+participant "StatsService" as STATS
+participant "EventPublisher" as PUB
+participant "GraderOutput" as OUT
+participant "stdout" as STDOUT
+
+loop until SIGTERM / Ctrl+C
+  APP -> TR : receive_from(communication)
+  TR -> COMM : receive()
+  COMM -> BUS : recv(16) [timeout 0.5 s]
+  alt timeout
+    COMM --> TR : None
+    TR --> APP : None
+  else frame received
+    BUS --> COMM : raw struct can_frame
+    COMM -> COMM : decode_can_frame() + monotonic_ns
+    COMM --> TR : CANFrame
+
+    alt ID not in framing map (noise)
+      TR --> APP : IGNORED
+    else single-frame ID (telemetry / fault)
+      TR -> APP : on_message(Message)
+      note right : synchronous Observer callback
+    else segmented ID (identification)
+      TR -> RA : process(frame)
+      RA --> TR : IN_PROGRESS / REJECTED / COMPLETED
+      opt COMPLETED
+        TR -> TR : completed_at_ns = monotonic_ns()
+        TR -> APP : on_message(Message)
+      end
+    end
+
+    group on_message (only for complete messages)
+      APP -> ROOT : dispatch(message)
+      ROOT -> SUB : dispatch(message)
+      SUB -> ROUTE : handler(message)
+      ROUTE -> DEC : decode(message)
+      alt ProtocolDecodeError
+        DEC --> SUB : raise
+        SUB --> APP : HANDLER_FAILED (logged, dropped)
+      else decoded result
+        DEC --> ROUTE : XResult
+        ROUTE -> CTRL : handle(result, message)
+        CTRL -> STATE : update(result)
+        CTRL -> PUB : publish(XEvent)
+        PUB -> OUT : on_event(event)
+        OUT -> STDOUT : JSON line + flush
+        CTRL -> STATS : record_processed(domain)
+        CTRL --> APP : ControllerResult(PROCESSED)
+      end
+    end
+
+    TR --> APP : FrameOutcome
+  end
+
+  APP -> STATS : on_frame(outcome): record_frame() if not IGNORED
+  APP -> STATS : poll(now_ns)
+  opt >= 1 s since last report
+    STATS --> APP : StatsEvent
+    APP -> PUB : publish(StatsEvent)
+    PUB -> OUT : on_event
+    OUT -> STDOUT : {"type":"stats",...}
+  end
+end
+
+APP -> PUB : shutdown(): final StatsEvent
+PUB -> OUT : on_event
+OUT -> STDOUT : final {"type":"stats",...}
+@enduml

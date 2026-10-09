@@ -1,0 +1,51 @@
+' Block-level architecture overview.
+' Rendered to images/Architecture_deepsea_tool.png and shown in the README.
+@startuml DeepSea_Architecture_Blocks
+!theme plain
+skinparam rectangle {
+  RoundCorner 12
+}
+skinparam ArrowColor #555555
+skinparam defaultTextAlignment center
+top to bottom direction
+
+title DeepSea CAN Diagnostic Tool — Architecture Overview
+
+actor "Operator / Grader" as USER
+cloud "CAN Bus\n(vcan0 / can0)" as BUS
+
+rectangle "main.py\n**Composition Root**\nbuilds and wires everything" as MAIN #EEEEEE
+
+rectangle "**Communication**\nreceive raw frames\n(SocketCAN adapter)" as COMM #DDEBF7
+rectangle "**Transport**\nframes → complete messages\n(single-frame + reassembly)" as TRANSPORT #DDEBF7
+rectangle "**Application Controller**\nreceive loop · frame counting\nperiodic stats" as APP #FFF2CC
+rectangle "**Routes**\nmessage ID → domain" as ROUTES #FFF2CC
+rectangle "**Protocol**\npayload → typed result\n(telemetry · fault · diagnostic)" as PROTOCOL #E2EFDA
+rectangle "**Controllers**\napply application rules\none per domain" as CONTROLLERS #E2EFDA
+rectangle "**Services**\napplication state · statistics\nevent publisher" as SERVICES #FCE4D6
+rectangle "**Output**\nDashboard (normal)\nNDJSON (grader)" as OUTPUT #FCE4D6
+
+BUS -down-> COMM : CAN frames
+COMM -down-> TRANSPORT : CANFrame
+TRANSPORT -down-> APP : Message\n+ FrameOutcome
+APP -down-> ROUTES : Message
+ROUTES -down-> PROTOCOL : decode
+PROTOCOL -down-> CONTROLLERS : Result
+CONTROLLERS -down-> SERVICES : update state\npublish event
+SERVICES -down-> OUTPUT : ApplicationEvent
+OUTPUT -down-> USER : stdout
+
+MAIN .right.> COMM
+MAIN .right.> TRANSPORT
+MAIN .right.> APP
+MAIN .right.> SERVICES
+MAIN .right.> OUTPUT
+
+legend right
+  | Color | Responsibility |
+  |<#DDEBF7>| How data arrives (bus-specific) |
+  |<#FFF2CC>| Flow control and dispatch |
+  |<#E2EFDA>| Meaning and business rules |
+  |<#FCE4D6>| State and presentation |
+endlegend
+@enduml

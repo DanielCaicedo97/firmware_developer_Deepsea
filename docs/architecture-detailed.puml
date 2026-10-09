@@ -1,0 +1,459 @@
+' Detailed class diagram of every layer, for developers changing the code.
+' Stereotypes (<<port>>, <<adapter>>, <<observer>>, ...) match the README's design-pattern table.
+@startuml DeepSea_Architecture
+!theme plain
+skinparam packageStyle rectangle
+skinparam classAttributeIconSize 0
+skinparam linetype ortho
+hide empty members
+left to right direction
+
+title DeepSea CAN Diagnostic Tool — Architecture
+
+' ============================ ENTRY POINT ============================
+package "main.py (Composition Root)" as MAIN {
+  class "main" <<module>> {
+    + main(argv) : int
+    + parse_arguments(argv)
+    + configure_logging(config)
+    + build_application(config, transport) : ApplicationController
+    + build_output(config, state) : EventConsumer
+    + run(application, communication, transport) : int
+    + stop(application, communication)
+    + seconds_to_ns(seconds) : int
+  }
+  class ShutdownRequest {
+    + requested : bool
+    + request(signum, frame)
+    + keep_running() : bool
+  }
+}
+
+' ============================ CONFIG ============================
+package "config" as CONFIG {
+  class ApplicationConfig <<frozen>> {
+    communication : CommunicationConfig
+    transport : TransportConfig
+    output : OutputConfig
+    logging : LoggingConfig
+  }
+  class CommunicationConfig <<frozen>> {
+    interface : str
+    receive_timeout_s : float
+    socket_receive_buffer_bytes : int?
+  }
+  class TransportConfig <<frozen>> {
+    framing : Mapping[int, FramingMode]
+    max_message_length : int = 64
+  }
+  class OutputConfig <<frozen>> {
+    mode : OutputMode
+    stats_interval_s : float = 1.0
+    dashboard_refresh_s : float = 0.2
+    recent_fault_limit : int = 5
+  }
+  class LoggingConfig <<frozen>> {
+    debug : bool
+  }
+  enum OutputMode {
+    NORMAL
+    GRADER
+  }
+  class "settings" <<module>> {
+    + build_application_config(interface, debug, grader) : ApplicationConfig
+    + build_framing_map(module_count) : dict
+  }
+  class "constants" <<module>> {
+    TELEMETRY_BASE_ID = 0x100
+    FAULT_ID = 0x1F0
+    DIAGNOSTIC_BASE_ID = 0x6F0
+    MODULE_COUNT = 4
+    MAX_DIAGNOSTIC_LENGTH = 64
+    CAN_FRAME_FORMAT = "=IB3x8s"
+    TELEMETRY_PAYLOAD_FORMAT = "<HHBBH"
+  }
+  ApplicationConfig *-- CommunicationConfig
+  ApplicationConfig *-- TransportConfig
+  ApplicationConfig *-- OutputConfig
+  ApplicationConfig *-- LoggingConfig
+  OutputConfig --> OutputMode
+}
+
+' ============================ MODELS ============================
+package "models" as MODELS {
+  class CANFrame <<frozen>> {
+    can_id : int
+    data : bytes
+    timestamp_ns : int?
+    + length : int
+  }
+  class InvalidFrameError <<exception>>
+  enum FramingMode {
+    SINGLE_FRAME
+    SEGMENTED
+  }
+  class TransportMetadata <<frozen>> {
+    framing : FramingMode
+    frame_count : int
+    received_at_ns : int?
+    completed_at_ns : int?
+  }
+  class Message <<frozen>> {
+    message_id : int
+    payload : bytes
+    metadata : TransportMetadata
+    source_id : int?
+  }
+  enum EventType {
+    TELEMETRY
+    FAULT
+    DIAG_COMPLETE
+    STATS
+  }
+  class TelemetryEvent <<frozen>> {
+    telemetry : TelemetryResult
+  }
+  class FaultEvent <<frozen>> {
+    fault : FaultResult
+  }
+  class DiagnosticCompleteEvent <<frozen>> {
+    diagnostic : DiagnosticResult
+    completed_at_ns : int
+  }
+  class StatsEvent <<frozen>> {
+    frames_processed : int
+  }
+  Message *-- TransportMetadata
+  TransportMetadata --> FramingMode
+}
+
+' ============================ COMMUNICATION ============================
+package "communication (Port + Adapter)" as COMM {
+  abstract class "CommunicationInterface<UnitT>" as CommunicationInterface <<port>> {
+    + {abstract} open()
+    + {abstract} receive() : UnitT?
+    + {abstract} close()
+  }
+  class CommunicationError <<exception>>
+  class SocketCanInterface <<adapter>> {
+    - config : CommunicationConfig
+    - socket_factory : SocketFactory
+    + invalid_frames : int
+    + open()
+    + receive() : CANFrame?
+    + close()
+  }
+  class "frame" <<module>> {
+    + decode_can_frame(raw, timestamp_ns) : CANFrame
+  }
+  CommunicationInterface <|.. SocketCanInterface
+  SocketCanInterface ..> "frame" : uses
+  SocketCanInterface ..> CommunicationError : raises
+}
+
+' ============================ TRANSPORT ============================
+package "transport" as TRANSPORT {
+  abstract class "Transport<UnitT>" as Transport <<port>> {
+    - listeners : List[TransportListener]
+    + add_listener(listener)
+    + remove_listener(listener)
+    + {abstract} process(unit) : FrameOutcome
+    + receive_from(communication) : FrameOutcome?
+    # deliver(message)
+  }
+  interface TransportListener <<observer>> {
+    + on_message(message : Message)
+  }
+  enum FrameOutcome {
+    IGNORED
+    ACCEPTED
+    COMPLETED
+    REJECTED
+  }
+  class CanTransport <<adapter>> {
+    - framing : Mapping[int, FramingMode]
+    - clock : () -> int
+    + process(unit : CANFrame) : FrameOutcome
+  }
+  class SegmentedReassembler {
+    - contexts : Dict[int, ReassemblyContext]
+    + process(frame) : ReassemblyResult
+    + reset_all()
+  }
+  class ReassemblyContext <<state machine>> {
+    source_id : int
+    state : ContextState
+    expected_length : int
+    expected_sequence : int
+    - buffer : bytearray (<= 64)
+    + start(length, data)
+    + append(data) : bool
+    + take_payload() : ReassemblyResult
+    + reset()
+  }
+  enum ContextState {
+    IDLE
+    RECEIVING
+  }
+  enum ReassemblyOutcome {
+    IN_PROGRESS
+    COMPLETED
+    ORPHAN_CONSECUTIVE_FRAME
+    SEQUENCE_ERROR
+    OVERSIZED
+    INVALID_LENGTH
+    MALFORMED_FRAME
+    UNSUPPORTED_FRAME_TYPE
+    UNKNOWN_SOURCE
+  }
+  class ReassemblyResult <<frozen>> {
+    outcome : ReassemblyOutcome
+    payload : bytes?
+    frame_count : int
+  }
+  Transport <|-- CanTransport
+  Transport o-- "0..*" TransportListener : notifies
+  Transport ..> FrameOutcome
+  CanTransport *-- "1" SegmentedReassembler
+  SegmentedReassembler *-- "4 (fixed)" ReassemblyContext
+  ReassemblyContext --> ContextState
+  SegmentedReassembler ..> ReassemblyResult
+  ReassemblyResult --> ReassemblyOutcome
+}
+
+' ============================ ROUTES ============================
+package "routes" as ROUTES {
+  abstract class "BaseRouter<TargetT>" as BaseRouter {
+    - name : str
+    - routes : Dict[int, TargetT]
+    + can_ids : Tuple[int]
+    + handles(can_id) : bool
+  }
+  class RootRouter <<front controller>> {
+    + include_router(subrouter)
+    + dispatch(message) : DispatchResult
+  }
+  class SubRouter {
+    - expected_errors : Tuple[Exception]
+    - sealed : bool
+    + add_route(can_id, handler)
+    + add_routes(can_ids, handler)
+    + route(*can_ids) <<decorator>>
+    + seal()
+    + dispatch(message) : DispatchResult
+  }
+  class "ControllerRoute<ResultT>" as ControllerRoute <<handler>> {
+    - decoder : Decoder
+    - controller : BaseController
+    + __call__(message) : ControllerResult
+  }
+  class DispatchResult <<frozen>> {
+    status : DispatchStatus
+    message : Message
+    router_name : str?
+    result : Any
+    error : Exception?
+  }
+  enum DispatchStatus {
+    SUCCESS
+    ROUTE_NOT_FOUND
+    HANDLER_NOT_FOUND
+    HANDLER_FAILED
+  }
+  class "routes_init" <<module>> {
+    + init_routes(telemetry, fault, diagnostic) : RootRouter
+    + build_telemetry_router(controller) : SubRouter
+    + build_fault_router(controller) : SubRouter
+    + build_diagnostic_router(controller) : SubRouter
+  }
+  BaseRouter <|-- RootRouter
+  BaseRouter <|-- SubRouter
+  RootRouter o-- "3" SubRouter : ID -> subrouter
+  SubRouter o-- "*" ControllerRoute : ID -> handler
+  DispatchResult --> DispatchStatus
+}
+
+' ============================ PROTOCOL ============================
+package "protocol (Decoders)" as PROTOCOL {
+  class "telemetry.decoder" <<module>> {
+    + decode_telemetry(message) : TelemetryResult
+  }
+  class "fault.decoder" <<module>> {
+    + decode_fault(message) : FaultResult
+  }
+  class "diagnostic.decoder" <<module>> {
+    + decode_diagnostic(message) : DiagnosticResult
+  }
+  class ProtocolDecodeError <<exception>>
+  class TelemetryResult <<frozen>> {
+    module_id : int
+    sequence : int
+    voltage_v : float
+    current_a : float
+    temperature_c : int
+    enabled : bool
+    fault : bool
+    derated : bool
+  }
+  class FaultResult <<frozen>> {
+    module_id : int
+    code : FaultCode
+  }
+  enum FaultCode {
+    OVERTEMP = 1
+    OVERVOLTAGE = 2
+    UNDERVOLTAGE = 3
+    ISOLATION_FAULT = 4
+  }
+  class DiagnosticResult <<frozen>> {
+    message_id : int
+    module_id : int
+    text : str
+    serial_number : str
+    firmware_version : str
+    counter : int?
+  }
+  "telemetry.decoder" ..> TelemetryResult
+  "fault.decoder" ..> FaultResult
+  "diagnostic.decoder" ..> DiagnosticResult
+  FaultResult --> FaultCode
+}
+
+' ============================ CONTROLLERS ============================
+package "controllers" as CONTROLLERS {
+  class ApplicationController <<listener>> {
+    - dispatch : Message -> DispatchResult
+    - clock : () -> int
+    + on_message(message)
+    + on_frame(outcome)
+    + report_stats_if_due()
+    + run(poll_frame, keep_running)
+    + shutdown()
+  }
+  abstract class "BaseController<ResultT>" as BaseController <<template method>> {
+    # state : ApplicationState
+    # stats : StatsService
+    # publisher : EventPublisher
+    + {abstract} handle(result, message) : ControllerResult
+    # reject(result, reason) : ControllerResult
+    # complete(result, event) : ControllerResult
+  }
+  class TelemetryController
+  class FaultController
+  class DiagnosticController
+  class ControllerResult <<frozen>> {
+    status : ControllerStatus
+    decoded : Any
+    event : ApplicationEvent?
+    reason : str?
+  }
+  enum ControllerStatus {
+    PROCESSED
+    REJECTED
+  }
+  BaseController <|-- TelemetryController
+  BaseController <|-- FaultController
+  BaseController <|-- DiagnosticController
+  ControllerResult --> ControllerStatus
+}
+
+' ============================ SERVICES ============================
+package "services" as SERVICES {
+  class ApplicationState {
+    - telemetry : [TelemetryResult?] x4
+    - latest_faults : [FaultResult?] x4
+    - completions : [DiagnosticCompleteEvent?] x4
+    - recent_faults : deque(maxlen=5)
+    + update_telemetry(result)
+    + record_fault(result)
+    + update_identification(result, completed_at_ns)
+    + snapshot() : StateSnapshot
+  }
+  class StateSnapshot <<frozen>>
+  class StatsService {
+    - frames_processed : int
+    - report_interval_ns : int
+    + record_frame()
+    + record_processed(domain)
+    + record_rejected(domain)
+    + poll(now_ns) : StatsEvent?
+    + stats_event() : StatsEvent
+  }
+  class EventPublisher <<pub/sub>> {
+    - consumers : List[EventConsumer]
+    + register(consumer)
+    + publish(event)
+  }
+  interface EventConsumer <<port>> {
+    + on_event(event : ApplicationEvent)
+  }
+  class EventDeliveryError <<exception>>
+  ApplicationState ..> StateSnapshot
+  EventPublisher o-- "1..*" EventConsumer
+  EventPublisher ..> EventDeliveryError : raises
+}
+
+' ============================ OUTPUT ============================
+package "output (Adapters)" as OUTPUT {
+  class Dashboard <<adapter>> {
+    - state : ApplicationState
+    - stream : stdout
+    - refresh_interval_ns : int
+    + on_event(event)
+    + render(now_ns)
+  }
+  class GraderOutput <<adapter>> {
+    - stream : stdout
+    + on_event(event)
+  }
+  class "grader" <<module>> {
+    + to_json_object(event) : dict
+    + to_json_line(event) : str
+  }
+  GraderOutput ..> "grader" : NDJSON
+}
+
+' ============================ CROSS-LAYER RELATIONS ============================
+EventConsumer <|.. Dashboard
+EventConsumer <|.. GraderOutput
+TransportListener <|.. ApplicationController
+
+"main" ..> ShutdownRequest : SIGTERM
+"main" ..> "settings" : builds config
+"main" ..> SocketCanInterface : creates
+"main" ..> CanTransport : creates
+"main" ..> ApplicationController : creates
+"main" ..> "routes_init" : composes routes
+"main" ..> EventPublisher : registers output
+
+SocketCanInterface ..> CANFrame : produces
+CanTransport ..> CANFrame : consumes
+CanTransport ..> Message : produces
+Transport ..> CommunicationInterface : receive_from
+
+ApplicationController --> RootRouter : dispatch(message)
+ApplicationController --> StatsService : record_frame / poll
+ApplicationController --> EventPublisher : publish(stats)
+
+ControllerRoute --> "telemetry.decoder" : decoder
+ControllerRoute --> "fault.decoder" : decoder
+ControllerRoute --> "diagnostic.decoder" : decoder
+ControllerRoute --> BaseController : handle(result)
+"routes_init" ..> SubRouter : builds
+"routes_init" ..> ControllerRoute : builds
+
+BaseController --> ApplicationState
+BaseController --> StatsService
+BaseController --> EventPublisher
+TelemetryController ..> TelemetryEvent : publishes
+FaultController ..> FaultEvent : publishes
+DiagnosticController ..> DiagnosticCompleteEvent : publishes
+StatsService ..> StatsEvent : creates
+
+Dashboard --> ApplicationState : snapshot()
+
+"telemetry.decoder" ..> ProtocolDecodeError : raises
+"fault.decoder" ..> ProtocolDecodeError : raises
+"diagnostic.decoder" ..> ProtocolDecodeError : raises
+SubRouter ..> ProtocolDecodeError : catches -> HANDLER_FAILED
+@enduml

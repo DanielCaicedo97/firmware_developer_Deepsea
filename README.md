@@ -129,6 +129,12 @@ One JSON object per line on **stdout**, flushed after every line, emitted live a
 
 The system is a pipeline of layers. Each layer has one responsibility and talks to the next through a small, explicit contract. Lower layers know nothing about upper layers. A layer can be replaced (a new bus, a new output format) without touching the others.
 
+<div align="center">
+  <img src="./images/Architecture_deepsea_tool.png" alt="DeepSea CAN Diagnostic Tool architecture overview" width="520">
+</div>
+
+The PlantUML sources live in [`docs/`](./docs): the block overview above, a detailed class diagram of every layer, and the sequence of one frame through the pipeline.
+
 ### Layers
 
 ```text
@@ -272,7 +278,8 @@ None of these emits a `diag_complete` line, and none affects any other module.
  ┃ ┃ ┗ 📂 config           # Protocol constants and runtime settings
  ┃ ┗ 📂 test               # unit / integration / e2e
  ┣ 📂 Context              # Specs: overview, architecture, standards, workflow, features
- ┣ 📂 docs                 # Operational guides (debug mode)
+ ┣ 📂 docs                 # Debug-mode guide and PlantUML architecture diagrams
+ ┣ 📂 images               # Rendered diagrams used by this README
  ┗ 📜 README.md
 ```
 
