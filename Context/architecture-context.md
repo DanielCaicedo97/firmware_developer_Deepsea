@@ -455,12 +455,32 @@ Every transport produces the same message object, independent of the medium:
 
 ```text
 Message
-├── source      (CAN ID, or the equivalent address on other media)
-├── payload     (bytes, complete)
-└── timestamp   (monotonic ns at completion)
+├── message_id  (what was received: the CAN ID on CAN)
+├── source_id   (transport source/context; equals the CAN ID on this bus)
+├── payload     (bytes, complete, never interpreted by the transport)
+└── metadata
+    ├── framing         (single_frame | segmented)
+    ├── frame_count     (frames that made up the message)
+    └── received_at_ns  (monotonic ns of the frame that completed it, captured at the communication boundary)
 ```
 
 This `Message` is the boundary described in §3: everything above it is protocol-agnostic.
+
+The grader `ts_ns` (completion timestamp) is **not** taken by the transport. Per feature spec 01 §9, the upper layer captures `time.monotonic_ns()` when the complete message is delivered to it.
+
+## 11.4 Frame Outcome
+
+`Transport.process(unit)` returns a `FrameOutcome` (`IGNORED`, `ACCEPTED`, `COMPLETED`, `REJECTED`). `IGNORED` means the unit is not on a supported source (e.g. noise `0x200`–`0x2FF`); every other value means the unit was on a real source. Upper layers use this for `frames_processed` accounting, so rejected diagnostic frames are counted and noise never is, without the transport owning any statistics.
+
+## 11.5 Reassembly Rules As Implemented
+
+* Contexts are created once at construction, one per segmented source in the framing map, and reset in place. Their number never changes at runtime.
+* **Any** First Frame on a source ends the previous attempt on that source, even if the new First Frame is then rejected (oversized, declared length < 8, DLC < 8).
+* First Frames declaring fewer than 8 bytes are rejected: CHALLENGE.md states messages are always longer than 7 bytes (no Single Frame case).
+* Consecutive Frames on an idle context are orphans and are ignored, leaving the context untouched.
+* A wrong sequence nibble, or a Consecutive Frame with no data, abandons the attempt.
+* Sequence nibbles go 1…15, 0, 1…; bytes beyond the declared length (final-frame padding) are discarded.
+* Other PCI types (Single Frame, Flow Control) are rejected without touching the context.
 
 ---
 
@@ -1063,55 +1083,66 @@ The architecture can be represented in the project as:
 ```text
 deepsea-can-diagnostic/
 │
-├── main.py
-│
-├── src/
+├── App/
+│   ├── src/                    (source root; imports are `from transport... import`)
+│   │   │
+│   │   ├── main.py             (entry point)
+│   │   │
+│   │   ├── communication/
+│   │   │   ├── __init__.py
+│   │   │   ├── interface.py
+│   │   │   ├── frame.py            (raw struct can_frame → CanFrame)
+│   │   │   ├── rx_buffer.py        (not yet implemented)
+│   │   │   └── socketcan.py
+│   │   │
+│   │   ├── transport/
+│   │   │   ├── __init__.py
+│   │   │   ├── transport.py        (Transport interface)
+│   │   │   ├── can_transport.py    (single-frame + segmented framing map)
+│   │   │   ├── reassembler.py
+│   │   │   └── listener.py
+│   │   │
+│   │   ├── protocol/
+│   │   │   ├── __init__.py
+│   │   │   ├── router.py
+│   │   │   ├── telemetry.py
+│   │   │   ├── fault.py
+│   │   │   └── diagnostic.py
+│   │   │
+│   │   ├── controller/
+│   │   │   ├── __init__.py
+│   │   │   └── controller.py
+│   │   │
+│   │   ├── services/
+│   │   │   ├── __init__.py
+│   │   │   ├── output.py
+│   │   │   ├── dashboard.py
+│   │   │   └── grader.py
+│   │   │
+│   │   ├── models/
+│   │   │   ├── __init__.py
+│   │   │   ├── can_frame.py
+│   │   │   ├── message.py
+│   │   │   ├── telemetry.py
+│   │   │   ├── fault.py
+│   │   │   └── diagnostic.py
+│   │   │
+│   │   └── config/
+│   │       ├── __init__.py
+│   │       ├── settings.py
+│   │       └── constants.py
 │   │
-│   ├── communication/
-│   │   ├── __init__.py
-│   │   ├── interface.py
-│   │   ├── frame.py
-│   │   ├── rx_buffer.py
-│   │   └── socketcan.py
-│   │
-│   ├── transport/
-│   │   ├── __init__.py
-│   │   ├── transport.py        (Transport interface)
-│   │   ├── can_transport.py    (single-frame + segmented framing map)
-│   │   ├── reassembler.py
-│   │   └── listener.py
-│   │
-│   ├── protocol/
-│   │   ├── __init__.py
-│   │   ├── router.py
-│   │   ├── telemetry.py
-│   │   ├── fault.py
-│   │   └── diagnostic.py
-│   │
-│   ├── controller/
-│   │   ├── __init__.py
-│   │   └── controller.py
-│   │
-│   ├── services/
-│   │   ├── __init__.py
-│   │   ├── output.py
-│   │   ├── dashboard.py
-│   │   └── grader.py
-│   │
-│   ├── models/
-│   │   ├── __init__.py
-│   │   ├── can_frame.py
-│   │   ├── message.py
-│   │   ├── telemetry.py
-│   │   ├── fault.py
-│   │   └── diagnostic.py
-│   │
-│   └── config/
-│       ├── __init__.py
-│       ├── settings.py
-│       └── constants.py
-│
-├── tests/
+│   └── test/                   (unittest; top-level dir for discovery, not a package)
+│       ├── helpers.py          (frame builders, FakeCanSocket, RecordingListener)
+│       ├── unit/               (one component in isolation)
+│       │   ├── communication/
+│       │   ├── transport/
+│       │   ├── models/
+│       │   └── config/
+│       ├── integration/        (layers wired across a boundary, fake socket)
+│       │   └── communication_transport/
+│       └── e2e/                (live vcan0 + challenge generator; skipped off the Pi)
+│           └── live_bus/
 │
 ├── docs/
 │   ├── PROJECT_OVERVIEW.md

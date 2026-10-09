@@ -43,10 +43,10 @@
 
 ```bash
 # Normal mode: in-place terminal dashboard
-python3 main.py --iface vcan0
+python3 App/src/main.py --iface vcan0
 
 # Grader mode: NDJSON event stream on stdout, logs on stderr
-python3 main.py --iface vcan0 --grader
+python3 App/src/main.py --iface vcan0 --grader
 ```
 
 ### Generate test traffic
@@ -58,6 +58,37 @@ python3 ~/challenge/can_generator/generator.py --iface vcan0 --duration 90
 ```
 
 Use a longer duration (for example `600`) to check that memory stays flat over many abandonment cycles.
+
+Add `--debug` to log every completed message and rejected frame to stderr.
+
+### Run the tests
+
+Standard library `unittest` only. Our code never transmits. Tests are grouped by type, with one subfolder per area:
+
+| Type | Folder | What it checks | Needs |
+| :--- | :--- | :--- | :--- |
+| Unit | `App/test/unit/<area>/` | One component in isolation (`communication`, `transport`, `models`, `config`) | Nothing |
+| Integration | `App/test/integration/<boundary>/` | Layers wired together across a boundary (e.g. `communication_transport`), with a fake socket | Nothing |
+| End-to-end | `App/test/e2e/<scenario>/` | Live challenge generator → `vcan0` → our stack, compared against the generator's ground truth | Pi with `vcan0` and `~/challenge/` (skipped elsewhere) |
+
+```bash
+cd App/src
+python3 -m unittest discover -s ../test                         # everything
+python3 -m unittest discover -s ../test/unit -t ../test         # one type: unit | integration | e2e
+```
+
+**With pytest (optional, development only).** The tests are plain `unittest`, so pytest runs them unchanged. `pytest.ini` puts `App/src` and `App/test` on the path. Run it from the repository root:
+
+```bash
+python3 -m pip install -r requirements-dev.txt                  # inside a venv
+python3 -m pytest                                               # everything
+python3 -m pytest App/test/unit                                 # one type: unit | integration | e2e
+python3 -m pytest App/test/unit/transport                       # one area
+```
+
+The application never imports pytest. `unittest` remains the zero-dependency way to run the suite on the Pi.
+
+The end-to-end test starts `~/challenge/can_generator/generator.py` unmodified, for 20 s by default. It writes the generator's ground-truth log to a temporary directory and deletes it afterwards. Override with `DEEPSEA_CAN_IFACE`, `DEEPSEA_GENERATOR` and `DEEPSEA_E2E_DURATION`.
 
 ---
 
@@ -201,16 +232,21 @@ None of these emits a `diag_complete` line, and none affects any other module.
 
 ```text
 📦 Root
- ┣ 📜 main.py            # Entry point: CLI parsing and component composition
- ┣ 📂 src
- ┃ ┣ 📂 communication    # Communication interface, SocketCAN, receive buffer
- ┃ ┣ 📂 transport        # Transport interface, CAN framing and reassembly
- ┃ ┣ 📂 protocol         # Router + telemetry, fault and identification decoders
- ┃ ┣ 📂 controller       # Application state for the 4 modules
- ┃ ┣ 📂 services         # Dashboard and grader NDJSON output
- ┃ ┣ 📂 models           # Dataclasses: frames, messages, decoded data
- ┃ ┗ 📂 config           # Constants and runtime settings
- ┣ 📂 tests              # Offline tests with synthetic frames
+ ┣ 📂 App
+ ┃ ┣ 📂 src                # Source root (on sys.path when main.py runs)
+ ┃ ┃ ┣ 📜 main.py          # Entry point: CLI parsing and component composition
+ ┃ ┃ ┣ 📂 communication    # Communication interface, SocketCAN, receive buffer
+ ┃ ┃ ┣ 📂 transport        # Transport interface, CAN framing and reassembly
+ ┃ ┃ ┣ 📂 protocol         # Router + telemetry, fault and identification decoders
+ ┃ ┃ ┣ 📂 controller       # Application state for the 4 modules
+ ┃ ┃ ┣ 📂 services         # Dashboard and grader NDJSON output
+ ┃ ┃ ┣ 📂 models           # Dataclasses: frames, messages, decoded data
+ ┃ ┃ ┗ 📂 config           # Constants and runtime settings
+ ┃ ┗ 📂 test
+ ┃   ┣ 📜 helpers.py       # Shared frame builders, fake socket, recording listener
+ ┃   ┣ 📂 unit             # One component per area folder
+ ┃   ┣ 📂 integration      # Layers wired together (fake socket)
+ ┃   ┗ 📂 e2e              # Live vcan0 + challenge generator (Pi only)
  ┣ 📂 Context            # Project specs: overview, architecture, standards, workflow
  ┗ 📜 README.md
 ```
@@ -221,9 +257,9 @@ None of these emits a `diag_complete` line, and none affects any other module.
 ## 🗺️ Roadmap
 
 - [x] **Specification:** project overview, architecture, code standards and workflow defined.
-- [ ] **Communication:** SocketCAN receive-only interface with kernel filter.
+- [ ] **Communication:** SocketCAN receive-only interface with kernel filter. *(Interface implemented and offline-tested; kernel filter and live `vcan0` check pending.)*
 - [ ] **Receive buffer:** bounded FIFO with overflow counter.
-- [ ] **Transport:** CAN single-frame passthrough and segmented reassembly.
+- [ ] **Transport:** CAN single-frame passthrough and segmented reassembly. *(Implemented and offline-tested; live `vcan0` check pending.)*
 - [ ] **Protocol:** telemetry, fault and identification decoders.
 - [ ] **Output:** grader NDJSON stream and terminal dashboard.
 - [ ] **Verification:** offline tests and a live run on `vcan0`.
