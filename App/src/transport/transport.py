@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Generic, List, TypeVar
+from typing import Generic, List, Optional, TypeVar
 
+from communication.interface import CommunicationInterface
 from models.message import Message
 from transport.listener import TransportListener
 
@@ -45,6 +46,18 @@ class Transport(ABC, Generic[UnitT]):
     @abstractmethod
     def process(self, unit: UnitT) -> FrameOutcome:
         """Process one received unit and deliver any message it completes."""
+
+    def receive_from(self, communication: CommunicationInterface[UnitT]) -> Optional[FrameOutcome]:
+        """Consume one unit from ``communication`` and process it.
+
+        Returns ``None`` when nothing valid arrived before the communication
+        timeout, otherwise the unit's ``FrameOutcome`` (which upper layers use
+        for frame accounting). ``CommunicationError`` propagates.
+        """
+        unit = communication.receive()
+        if unit is None:
+            return None
+        return self.process(unit)
 
     def _deliver(self, message: Message) -> None:
         """Notify every registered listener of a complete message."""

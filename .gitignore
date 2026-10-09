@@ -114,7 +114,8 @@ Thumbs.db
 # Project-specific generated data
 # ==============================
 
-output/
+# Anchored: App/src/output/ is a source package and must stay tracked.
+/output/
 outputs/
 results/
 reports/

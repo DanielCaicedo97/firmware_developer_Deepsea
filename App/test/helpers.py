@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import socket
 import struct
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 from config.constants import (
     CAN_FRAME_FORMAT,
@@ -18,12 +18,19 @@ from config.constants import (
     PCI_FIRST_FRAME,
     SEQUENCE_NUMBER_MASK,
 )
+from controllers.base_controller import BaseController
+from controllers.results import ControllerResult, ControllerStatus
+from models.application_event import ApplicationEvent, EventType
 from models.can_frame import CANFrame
-from models.message import Message
+from models.message import FramingMode, Message, TransportMetadata
+from services.application_state import ApplicationState
+from services.event_publisher import EventConsumer, EventPublisher
+from services.stats_service import StatsService
 from transport.listener import TransportListener
 
 FIRST_FRAME_DATA_SIZE = 6
 CONSECUTIVE_FRAME_DATA_SIZE = 7
+STATS_INTERVAL_NS = 1_000
 
 ReceiveItem = Union[bytes, BaseException]
 
@@ -67,6 +74,20 @@ def interleave(*frame_lists: List[CANFrame]) -> List[CANFrame]:
     return interleaved
 
 
+# --- Complete-message builder -------------------------------------------------
+
+
+def complete_message(
+    message_id: int,
+    payload: bytes,
+    framing: FramingMode = FramingMode.SINGLE_FRAME,
+    completed_at_ns: Optional[int] = None,
+) -> Message:
+    """Build a complete message as the transport would deliver it."""
+    metadata = TransportMetadata(framing=framing, frame_count=1, received_at_ns=None, completed_at_ns=completed_at_ns)
+    return Message(message_id=message_id, payload=payload, metadata=metadata, source_id=message_id)
+
+
 # --- Raw SocketCAN bytes --------------------------------------------------------
 
 
@@ -100,23 +121,28 @@ class FakeCanSocket:
         self.closed = False
 
     def settimeout(self, timeout: float) -> None:
+        """Record the timeout."""
         self.timeout = timeout
 
     def setsockopt(self, level: int, option: int, value: int) -> None:
+        """Record a socket option."""
         self.options.append((level, option, value))
 
     def bind(self, address: Tuple[str]) -> None:
+        """Record the address, or raise the configured bind error."""
         if self.bind_error is not None:
             raise self.bind_error
         self.bound_to = address
 
     def recv(self, size: int) -> bytes:
+        """Return the next queued frame, or raise the next queued exception."""
         item = self.items.pop(0) if self.items else socket.timeout()
         if isinstance(item, BaseException):
             raise item
         return item
 
     def close(self) -> None:
+        """Mark the socket closed."""
         self.closed = True
 
 
@@ -127,4 +153,56 @@ class RecordingListener(TransportListener):
         self.messages: List[Message] = []
 
     def on_message(self, message: Message) -> None:
+        """Record a delivered message."""
         self.messages.append(message)
+
+
+class RecordingConsumer(EventConsumer):
+    """Collects every application event delivered to it."""
+
+    def __init__(self) -> None:
+        self.events: List[ApplicationEvent] = []
+
+    def on_event(self, event: ApplicationEvent) -> None:
+        """Record a delivered event."""
+        self.events.append(event)
+
+
+class RecordingPublisher(EventPublisher):
+    """A real ``EventPublisher`` with one ``RecordingConsumer`` registered."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.consumer = RecordingConsumer()
+        self.register(self.consumer)
+
+    @property
+    def events(self) -> List[ApplicationEvent]:
+        """Every event published so far."""
+        return self.consumer.events
+
+
+class RecordingController(BaseController[Any]):
+    """Controller double that records each (result, message) it handles and accepts it."""
+
+    event_type = EventType.TELEMETRY
+
+    def __init__(self) -> None:
+        super().__init__(ApplicationState(), StatsService(STATS_INTERVAL_NS), RecordingPublisher())
+        self.handled: List[Tuple[Any, Message]] = []
+
+    def handle(self, result: Any, message: Message) -> ControllerResult:
+        """Record a handled result and its message."""
+        self.handled.append((result, message))
+        return ControllerResult(ControllerStatus.PROCESSED, result)
+
+
+class FakeClock:
+    """Monotonic nanosecond clock double; ``now`` is set by the test."""
+
+    def __init__(self, now: int = 0) -> None:
+        self.now = now
+
+    def __call__(self) -> int:
+        """Return the current fake time."""
+        return self.now

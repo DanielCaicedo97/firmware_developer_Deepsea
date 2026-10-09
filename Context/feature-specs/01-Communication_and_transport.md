@@ -456,6 +456,8 @@ stdout → NDJSON only
 stderr → diagnostics/logging
 ```
 
+How to enable debug logging, the catalog of debug lines emitted by this feature, and how to read them against the generator are documented in [`./docs/debug-mode.md`](/docs/debug-mode.md).
+
 ---
 
 ## Expected Project Structure

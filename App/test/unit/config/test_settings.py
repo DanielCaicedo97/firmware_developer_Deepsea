@@ -3,7 +3,14 @@
 import unittest
 
 from config.constants import DIAGNOSTIC_BASE_ID, FAULT_ID, MAX_DIAGNOSTIC_LENGTH, MODULE_COUNT
-from config.settings import CommunicationConfig, TransportConfig, build_application_config, build_framing_map
+from config.settings import (
+    CommunicationConfig,
+    OutputConfig,
+    OutputMode,
+    TransportConfig,
+    build_application_config,
+    build_framing_map,
+)
 from models.message import FramingMode
 
 
@@ -52,6 +59,16 @@ class FramingMapTest(unittest.TestCase):
         self.assertEqual(config.communication.interface, "vcan0")
         self.assertTrue(config.logging.debug)
         self.assertEqual(config.transport.max_message_length, MAX_DIAGNOSTIC_LENGTH)
+        self.assertIs(config.output.mode, OutputMode.NORMAL)
+
+    def test_grader_flag_selects_grader_mode(self) -> None:
+        config = build_application_config(interface="vcan0", grader=True)
+        self.assertIs(config.output.mode, OutputMode.GRADER)
+
+    def test_output_config_rejects_non_positive_values(self) -> None:
+        for kwargs in ({"stats_interval_s": 0}, {"dashboard_refresh_s": -1}, {"recent_fault_limit": 0}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                OutputConfig(**kwargs)
 
 
 if __name__ == "__main__":

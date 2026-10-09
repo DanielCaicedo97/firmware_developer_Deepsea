@@ -67,8 +67,8 @@ Standard library `unittest` only. Our code never transmits. Tests are grouped by
 
 | Type | Folder | What it checks | Needs |
 | :--- | :--- | :--- | :--- |
-| Unit | `App/test/unit/<area>/` | One component in isolation (`communication`, `transport`, `models`, `config`) | Nothing |
-| Integration | `App/test/integration/<boundary>/` | Layers wired together across a boundary (e.g. `communication_transport`), with a fake socket | Nothing |
+| Unit | `App/test/unit/<area>/` | One component in isolation (`communication`, `transport`, `models`, `config`, `protocol`, `routes`, `controllers`, `services`, `output`) | Nothing |
+| Integration | `App/test/integration/<boundary>/` | Layers wired together across a boundary (`communication_transport`, `transport_protocol`), and `application`: the whole stack composed by `main.py` in both modes, with a fake socket | Nothing |
 | End-to-end | `App/test/e2e/<scenario>/` | Live challenge generator → `vcan0` → our stack, compared against the generator's ground truth | Pi with `vcan0` and `~/challenge/` (skipped elsewhere) |
 
 ```bash
@@ -178,8 +178,8 @@ The tool is layered so that the application cares about **messages and their mea
           └─────────────┼───────────────┘
                         ▼
 ┌────────────────────────────────────────────────┐
-│                 CONTROLLER                     │
-│   Application state for the 4 modules          │
+│        CONTROLLERS  →  STATE · STATS           │
+│   one per domain · application events          │
 └───────────────────────┬────────────────────────┘
                         │
               ┌─────────┴─────────┐
@@ -234,16 +234,18 @@ None of these emits a `diag_complete` line, and none affects any other module.
 📦 Root
  ┣ 📂 App
  ┃ ┣ 📂 src                # Source root (on sys.path when main.py runs)
- ┃ ┃ ┣ 📜 main.py          # Entry point: CLI parsing and component composition
- ┃ ┃ ┣ 📂 communication    # Communication interface, SocketCAN, receive buffer
- ┃ ┃ ┣ 📂 transport        # Transport interface, CAN framing and reassembly
- ┃ ┃ ┣ 📂 protocol         # Router + telemetry, fault and identification decoders
- ┃ ┃ ┣ 📂 controller       # Application state for the 4 modules
- ┃ ┃ ┣ 📂 services         # Dashboard and grader NDJSON output
- ┃ ┃ ┣ 📂 models           # Dataclasses: frames, messages, decoded data
+ ┃ ┃ ┣ 📜 main.py          # Composition root: CLI, wiring of every layer, lifecycle
+ ┃ ┃ ┣ 📂 communication    # Communication interface, SocketCAN (receive only)
+ ┃ ┃ ┣ 📂 transport        # Transport interface, CAN framing, reassembly, completion timestamp
+ ┃ ┃ ┣ 📂 protocol         # Decoders and result models per domain: telemetry, fault, diagnostic
+ ┃ ┃ ┣ 📂 routes           # Generic router + per-domain routes (decoder → controller)
+ ┃ ┃ ┣ 📂 controllers      # Per-domain controllers and the application controller (receive loop)
+ ┃ ┃ ┣ 📂 services         # Event publisher and consumer contract, application state, statistics
+ ┃ ┃ ┣ 📂 output           # Terminal dashboard and grader NDJSON
+ ┃ ┃ ┣ 📂 models           # Shared models: CAN frame, complete message, application events
  ┃ ┃ ┗ 📂 config           # Constants and runtime settings
  ┃ ┗ 📂 test
- ┃   ┣ 📜 helpers.py       # Shared frame builders, fake socket, recording listener
+ ┃   ┣ 📜 helpers.py       # Shared builders and test doubles (fake socket, recorders, clock)
  ┃   ┣ 📂 unit             # One component per area folder
  ┃   ┣ 📂 integration      # Layers wired together (fake socket)
  ┃   ┗ 📂 e2e              # Live vcan0 + challenge generator (Pi only)
@@ -260,8 +262,9 @@ None of these emits a `diag_complete` line, and none affects any other module.
 - [ ] **Communication:** SocketCAN receive-only interface with kernel filter. *(Interface implemented and offline-tested; kernel filter and live `vcan0` check pending.)*
 - [ ] **Receive buffer:** bounded FIFO with overflow counter.
 - [ ] **Transport:** CAN single-frame passthrough and segmented reassembly. *(Implemented and offline-tested; live `vcan0` check pending.)*
-- [ ] **Protocol:** telemetry, fault and identification decoders.
-- [ ] **Output:** grader NDJSON stream and terminal dashboard.
+- [x] **Protocol:** telemetry, fault and identification decoders.
+- [x] **Architecture:** layered routes, controllers, services and output (spec 04).
+- [ ] **Output:** grader NDJSON stream and terminal dashboard. *(Implemented and offline-tested; live `vcan0` check pending.)*
 - [ ] **Verification:** offline tests and a live run on `vcan0`.
 
 ---

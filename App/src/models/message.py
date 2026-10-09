@@ -19,13 +19,16 @@ class TransportMetadata:
     """Transport-level facts about how a message was obtained.
 
     ``received_at_ns`` is the communication-boundary timestamp of the frame that
-    completed the message. It is not the grader completion timestamp, which the
-    upper layer captures when the message is delivered.
+    completed the message. ``completed_at_ns`` is the transport clock
+    (``time.monotonic_ns()``) read at the moment the message became complete,
+    i.e. when reassembly finished for a segmented message. It is the grader's
+    ``diag_complete.ts_ns`` and every later layer carries it unchanged.
     """
 
     framing: FramingMode
     frame_count: int
     received_at_ns: Optional[int] = None
+    completed_at_ns: Optional[int] = None
 
 
 @dataclass(frozen=True)

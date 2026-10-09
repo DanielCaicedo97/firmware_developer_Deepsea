@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from types import MappingProxyType
 from typing import Mapping, Optional
 
 from config.constants import (
+    DEFAULT_DASHBOARD_REFRESH_S,
     DEFAULT_RECEIVE_TIMEOUT_S,
+    DEFAULT_RECENT_FAULT_LIMIT,
+    DEFAULT_STATS_INTERVAL_S,
     DIAGNOSTIC_BASE_ID,
     FAULT_ID,
     FIRST_FRAME_MAX_DECLARED_LENGTH,
@@ -58,6 +62,36 @@ class TransportConfig:
         object.__setattr__(self, "framing", MappingProxyType(dict(self.framing)))
 
 
+class OutputMode(Enum):
+    """How application events are presented."""
+
+    NORMAL = "normal"
+    GRADER = "grader"
+
+
+@dataclass(frozen=True)
+class OutputConfig:
+    """Settings for the application and output layers.
+
+    ``stats_interval_s`` is how often stats are reported (ADAPTER.md: at least
+    every few seconds); ``dashboard_refresh_s`` throttles dashboard redraws
+    between stats reports; ``recent_fault_limit`` bounds the fault history.
+    """
+
+    mode: OutputMode = OutputMode.NORMAL
+    stats_interval_s: float = DEFAULT_STATS_INTERVAL_S
+    dashboard_refresh_s: float = DEFAULT_DASHBOARD_REFRESH_S
+    recent_fault_limit: int = DEFAULT_RECENT_FAULT_LIMIT
+
+    def __post_init__(self) -> None:
+        if self.stats_interval_s <= 0:
+            raise ValueError("stats interval must be positive")
+        if self.dashboard_refresh_s <= 0:
+            raise ValueError("dashboard refresh interval must be positive")
+        if self.recent_fault_limit <= 0:
+            raise ValueError("recent fault limit must be positive")
+
+
 @dataclass(frozen=True)
 class LoggingConfig:
     """Settings for diagnostic logging, which always goes to stderr."""
@@ -71,6 +105,7 @@ class ApplicationConfig:
 
     communication: CommunicationConfig
     transport: TransportConfig
+    output: OutputConfig = field(default_factory=OutputConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
 
@@ -92,6 +127,7 @@ def build_framing_map(module_count: int = MODULE_COUNT) -> dict[int, FramingMode
 def build_application_config(
     interface: str,
     debug: bool = False,
+    grader: bool = False,
     module_count: int = MODULE_COUNT,
     max_message_length: int = MAX_DIAGNOSTIC_LENGTH,
 ) -> ApplicationConfig:
@@ -102,5 +138,6 @@ def build_application_config(
             framing=build_framing_map(module_count),
             max_message_length=max_message_length,
         ),
+        output=OutputConfig(mode=OutputMode.GRADER if grader else OutputMode.NORMAL),
         logging=LoggingConfig(debug=debug),
     )

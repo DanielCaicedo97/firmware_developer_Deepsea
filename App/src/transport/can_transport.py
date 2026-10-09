@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import time
+from typing import Callable
 
 from config.settings import TransportConfig
 from models.can_frame import CANFrame
@@ -12,16 +14,20 @@ from transport.transport import FrameOutcome, Transport
 
 logger = logging.getLogger(__name__)
 
+Clock = Callable[[], int]
+
 
 class CanTransport(Transport[CANFrame]):
     """Turns validated CAN frames into complete messages.
 
     The framing map (from configuration) says how each CAN ID is framed, not
     what it carries. Frames on IDs outside the map, such as noise, are ignored.
+    ``clock`` stamps each message's ``completed_at_ns`` when it completes.
     """
 
-    def __init__(self, config: TransportConfig) -> None:
+    def __init__(self, config: TransportConfig, clock: Clock = time.monotonic_ns) -> None:
         super().__init__()
+        self._clock = clock
         self._framing = config.framing
         segmented_ids = [can_id for can_id, mode in config.framing.items() if mode is FramingMode.SEGMENTED]
         self._reassembler = SegmentedReassembler(segmented_ids, config.max_message_length)
@@ -57,8 +63,12 @@ class CanTransport(Transport[CANFrame]):
         payload = result.payload if result.payload is not None else b""
         self._deliver(self._build_message(frame, FramingMode.SEGMENTED, payload, result.frame_count))
 
-    @staticmethod
-    def _build_message(frame: CANFrame, framing: FramingMode, payload: bytes, frame_count: int) -> Message:
-        """Build the protocol-independent message for a CAN source."""
-        metadata = TransportMetadata(framing=framing, frame_count=frame_count, received_at_ns=frame.timestamp_ns)
+    def _build_message(self, frame: CANFrame, framing: FramingMode, payload: bytes, frame_count: int) -> Message:
+        """Build the protocol-independent message for a CAN source, stamped as complete now."""
+        metadata = TransportMetadata(
+            framing=framing,
+            frame_count=frame_count,
+            received_at_ns=frame.timestamp_ns,
+            completed_at_ns=self._clock(),
+        )
         return Message(message_id=frame.can_id, payload=payload, metadata=metadata, source_id=frame.can_id)

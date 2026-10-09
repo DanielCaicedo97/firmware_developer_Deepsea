@@ -4,13 +4,62 @@ import unittest
 
 from config.constants import DIAGNOSTIC_BASE_ID, FAULT_ID, MODULE_COUNT, TELEMETRY_BASE_ID
 from config.settings import TransportConfig, build_framing_map
-from helpers import RecordingListener, consecutive_frame, first_frame, interleave, segment_message
+from helpers import FakeClock, RecordingListener, consecutive_frame, first_frame, interleave, segment_message
 from models.can_frame import CANFrame
 from models.message import FramingMode
 from transport.can_transport import CanTransport
 from transport.transport import FrameOutcome
 
 MESSAGE = b"SN:PMU-4472-B FW:2.3.1 #7"
+
+
+class FakeCommunication:
+    """Communication double returning queued frames, then ``None`` (timeout)."""
+
+    def __init__(self, frames: list) -> None:
+        self.frames = list(frames)
+
+    def receive(self) -> object:
+        return self.frames.pop(0) if self.frames else None
+
+
+class CompletionTimestampTest(unittest.TestCase):
+    """The transport stamps ``completed_at_ns`` when a message completes."""
+
+    def setUp(self) -> None:
+        self.clock = FakeClock()
+        self.transport = CanTransport(TransportConfig(framing=build_framing_map()), clock=self.clock)
+        self.listener = RecordingListener()
+        self.transport.add_listener(self.listener)
+
+    def test_segmented_message_stamped_when_reassembly_completes(self) -> None:
+        frames = segment_message(DIAGNOSTIC_BASE_ID, MESSAGE)
+        for index, frame in enumerate(frames):
+            self.clock.now = 1_000 + index
+            self.transport.process(frame)
+        message, = self.listener.messages
+        self.assertEqual(message.metadata.completed_at_ns, 1_000 + len(frames) - 1)
+
+    def test_single_frame_message_stamped_on_delivery(self) -> None:
+        self.clock.now = 77
+        self.transport.process(CANFrame(can_id=FAULT_ID, data=bytes(8), timestamp_ns=5))
+        metadata = self.listener.messages[0].metadata
+        self.assertEqual((metadata.received_at_ns, metadata.completed_at_ns), (5, 77))
+
+
+class ReceiveFromTest(unittest.TestCase):
+    """``receive_from`` consumes one unit from the communication interface."""
+
+    def setUp(self) -> None:
+        self.transport = CanTransport(TransportConfig(framing=build_framing_map()))
+
+    def test_returns_the_outcome_of_the_received_frame(self) -> None:
+        communication = FakeCommunication([CANFrame(can_id=FAULT_ID, data=bytes(8)), CANFrame(can_id=0x2A0, data=b"")])
+        self.assertIs(self.transport.receive_from(communication), FrameOutcome.COMPLETED)
+        self.assertIs(self.transport.receive_from(communication), FrameOutcome.IGNORED)
+
+    def test_returns_none_when_nothing_arrived(self) -> None:
+        self.assertIsNone(self.transport.receive_from(FakeCommunication([])))
 
 
 class CanTransportTest(unittest.TestCase):

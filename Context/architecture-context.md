@@ -461,16 +461,19 @@ Message
 └── metadata
     ├── framing         (single_frame | segmented)
     ├── frame_count     (frames that made up the message)
-    └── received_at_ns  (monotonic ns of the frame that completed it, captured at the communication boundary)
+    ├── received_at_ns  (monotonic ns of the frame that completed it, captured at the communication boundary)
+    └── completed_at_ns (transport clock, time.monotonic_ns(), read when the message became complete)
 ```
 
 This `Message` is the boundary described in §3: everything above it is protocol-agnostic.
 
-The grader `ts_ns` (completion timestamp) is **not** taken by the transport. Per feature spec 01 §9, the upper layer captures `time.monotonic_ns()` when the complete message is delivered to it.
+The grader `ts_ns` (completion timestamp) is `completed_at_ns`. Spec 04 §5.2/§8 requires it to be captured when reassembly completes and preserved through every later layer, so `CanTransport` stamps it with its injectable clock (default `time.monotonic_ns`) as it builds the message. This supersedes spec 01 §9, where the upper layer captured it on delivery. `DiagnosticController` copies it into `DiagnosticCompleteEvent.completed_at_ns` and the grader writes it unchanged. It never reads the clock itself.
 
 ## 11.4 Frame Outcome
 
 `Transport.process(unit)` returns a `FrameOutcome` (`IGNORED`, `ACCEPTED`, `COMPLETED`, `REJECTED`). `IGNORED` means the unit is not on a supported source (e.g. noise `0x200`–`0x2FF`); every other value means the unit was on a real source. Upper layers use this for `frames_processed` accounting, so rejected diagnostic frames are counted and noise never is, without the transport owning any statistics.
+
+`Transport.receive_from(communication)` is how the transport consumes frames from the communication layer (spec 04 §5.2). It receives one unit, processes it and returns its `FrameOutcome`, or `None` when the receive timed out. The receive loop calls it through a `functools.partial` built in `main.py`, so the application controller never sees a frame or the communication object.
 
 ## 11.5 Reassembly Rules As Implemented
 
@@ -660,6 +663,51 @@ For the current challenge, classification is based primarily on CAN identifiers.
 
 The Router should not contain detailed decoding logic.
 
+## 17.1 Router As Implemented (Feature 03)
+
+Routing is a two-level hierarchy in the `routes/` package (renamed from `router/` by spec 04), a Python version of the `RootRouter`/`SubRouter` design described in spec 03. It uses only the standard library and no routing framework. Handlers are `ControllerRoute(decoder, controller)` objects: the route decodes, then delegates the result to its domain controller.
+
+```text
+Complete Message ──► RootRouter ──(message_id)──► SubRouter ──(message_id)──► handler(message)
+                         │                            │
+                         └─ no subrouter:             └─ no handler:
+                            ROUTE_NOT_FOUND              HANDLER_NOT_FOUND
+```
+
+| Module | Contents |
+| --- | --- |
+| `common/router.py` | `BaseRouter[TargetT]` (per-instance `message_id → target` table and the shared validation), `SubRouter(name, expected_errors=())` (`add_route`, `add_routes`, decorator `@sub.route(*ids)`, `dispatch`, `seal()`/`sealed`), `RootRouter(name="root")` (`include_router`, `dispatch`), `RouteRegistrationError(ValueError)`, `Handler = Callable[[Message], Any]`. Generic: no decoder or controller imports. |
+| `common/results.py` | `DispatchStatus` enum and frozen `DispatchResult(status, message, router_name, result, error)` with `succeeded`. |
+| `common/controller_route.py` | `ControllerRoute(decoder, controller)`: calls `decoder(message)`, then `controller.handle(result, message)`, and returns the controller's `ControllerResult` (its `decoded` field is the decoder result). A decode error propagates before the controller runs. Also `DECODER_ERRORS = (ProtocolDecodeError,)` and `per_module_ids(base_id)`. |
+| `common/__init__.py` | Public API: the generic classes, results and the error. |
+| `telemetry/routes.py`, `fault/routes.py`, `diagnostic/routes.py` | `build_<domain>_router(controller, decoder=decode_<domain>) -> SubRouter`. Each registers its domain's IDs with one `ControllerRoute`. |
+| `routes_init.py` | `init_routes(telemetry_controller, fault_controller, diagnostic_controller, root=None) -> RootRouter`: composes the three domain routers. |
+
+Challenge routes (`init_routes`):
+
+| Subrouter | Message IDs | Handler |
+| --- | --- | --- |
+| `telemetry` | `TELEMETRY_BASE_ID` … `+ MODULE_COUNT - 1` (`0x100–0x103`), one `add_routes` call | `decode_telemetry` → `TelemetryController` |
+| `fault` | `FAULT_ID` (`0x1F0`) | `decode_fault` → `FaultController` |
+| `diagnostic` | `DIAGNOSTIC_BASE_ID` … `+ MODULE_COUNT - 1` (`0x6F0–0x6F3`), one `add_routes` call | `decode_diagnostic` → `DiagnosticController` |
+| none | noise `0x200–0x2FF` and every other ID | none: `ROUTE_NOT_FOUND` |
+
+`DispatchStatus`:
+
+* `SUCCESS`: `result` is the handler's return value. For the challenge routes, that is the Feature 02 frozen result (`TelemetryResult`, `FaultResult` or `DiagnosticResult`). There is no second decoding-status model.
+* `ROUTE_NOT_FOUND`: the root has no subrouter for the ID. `router_name`, `result` and `error` are `None`.
+* `HANDLER_NOT_FOUND`: a subrouter was dispatched for an ID it has no handler for. `router_name` is set. Through the root this cannot happen, because the root only indexes registered IDs. It shows up only when a subrouter is dispatched directly.
+* `HANDLER_FAILED`: the handler raised one of its subrouter's `expected_errors`, which is kept in `error`. The challenge subrouters use `expected_errors=(ProtocolDecodeError,)`, so an invalid payload drops one message and the receive loop goes on.
+
+Rules:
+
+* **Registration is explicit and validated.** IDs must be `int` (not `bool`) in `0 … CAN_STANDARD_ID_MASK`, handlers must be callable, and an ID can be registered only once per router. A multi-ID registration is all-or-none. Violations raise `RouteRegistrationError`, and nothing is ever overwritten.
+* **Inclusion indexes and seals.** `include_router` registers the subrouter's IDs on the root, all-or-none and rejecting overlaps, then seals the subrouter. A later `add_route` on it raises instead of being silently unreachable, so a subrouter must be fully registered before it is included.
+* **Errors.** Only the configured `expected_errors` are caught. Anything else is a programming error and propagates. A subrouter with no `expected_errors` catches nothing.
+* **What routers never do.** They read only `message.message_id`. They never parse payloads, reassemble, hold message state, open sockets, log or print.
+* **No hidden instances.** There is no module-level router or registry. Each `init_routes()` call builds independent routers, and the entry point will own construction.
+* **Not a listener.** The root router is not a `TransportListener`, because `on_message` returns nothing and dispatch has to return its result. `ApplicationController` is the listener: it calls `root.dispatch()` (injected as a callable) and logs any non-`SUCCESS` result at debug level.
+
 ---
 
 # 18. Protocol Handlers
@@ -699,6 +747,23 @@ Responsible for:
 * Producing diagnostic information
 
 Each handler should focus on its own protocol.
+
+## 18.1 Decoders As Implemented (Feature 02)
+
+Each decoder is a plain function `decode_x(message: Message) -> XResult` in `protocol/<domain>/decoder.py`. It consumes the Feature 01 `Message` unchanged, and returns a frozen result dataclass from `protocol/<domain>/models.py` (moved out of `models/` by spec 04 §5.3: each domain owns its result models). Each domain package re-exports both, e.g. `from protocol.telemetry import TelemetryResult, decode_telemetry`. On invalid input it raises `protocol.common.ProtocolDecodeError` (a `ValueError`, like `InvalidFrameError`). It never returns a partial or successful result for bad input. The challenge subrouters (§17.1) catch `ProtocolDecodeError` only and report it as `HANDLER_FAILED`, so a bad payload drops one message and the receive loop keeps running. All offsets, scales, masks and text prefixes live in `config/constants.py`.
+
+| Decoder | Accepts | Result | Rejects |
+| --- | --- | --- | --- |
+| `decode_telemetry` | `TELEMETRY_BASE_ID + module`, 8 bytes `<HHBBH` | `TelemetryResult(module_id, sequence, voltage_v, current_a, temperature_c, enabled, fault, derated)` | ID outside the 4 telemetry IDs, length ≠ 8 |
+| `decode_fault` | `FAULT_ID`, 8 bytes | `FaultResult(module_id, code: FaultCode)` | other ID, length ≠ 8, module ≥ `MODULE_COUNT`, code ∉ 1–4, non-zero bytes 2–7 |
+| `decode_diagnostic` | `DIAGNOSTIC_BASE_ID + module`, reassembled payload | `DiagnosticResult(message_id, module_id, text, serial_number, firmware_version, counter)` | ID outside the 4 diagnostic IDs, length outside 8–64, non-ASCII or non-printable text, text not `SN:<x> FW:<y>[ #<digits>]` |
+
+Interpretations:
+
+* **Telemetry module** comes from the CAN ID, and **fault module** from payload byte 0, as CHALLENGE.md defines.
+* **Scaled values are not rounded** (`voltage_v = raw × 0.1`). Rounding to 2 decimals is an output concern (code standards §16).
+* **Undocumented status bits 3–7 are ignored**, not rejected.
+* **Identification text format**: the generator sends `f"{DIAG_STRINGS[ctx]} #{counter}"`, and the CHALLENGE.md example shows `SN:… FW:…` with no counter. So `counter` is optional (`None` when absent). `text` keeps the exact received string, because grader `diag_complete.string` must match it byte for byte.
 
 ---
 
@@ -809,6 +874,52 @@ stderr
 The underlying application state and protocol processing should remain identical between both modes.
 
 Only the presentation/output strategy changes.
+
+## 22.1 Application Layers As Implemented (Feature 04)
+
+Spec 04 (`feature-specs/04-architecture-specification.md`) is implemented as follows. The runtime flow:
+
+```text
+SocketCanInterface --receive--> CanTransport.receive_from --FrameOutcome--> ApplicationController.on_frame --> StatsService
+                                      |
+                                      +-- complete Message --> ApplicationController.on_message --> RootRouter.dispatch
+                                                                                                        |
+                       SubRouter --> ControllerRoute: decode_<domain>(message) --> <Domain>Controller.handle(result, message)
+                                                                                         |
+                                                       ApplicationState <-- update ------+
+                                                                                         +-- publish(event) --> EventPublisher --on_event--> one EventConsumer
+                                                                                                                                       (GraderOutput | Dashboard)
+```
+
+**Events** (`models/application_event.py`). This is the one contract between controllers and output. The events are frozen dataclasses, each with a `ClassVar event_type: EventType` whose value is ADAPTER.md's `type`: `TelemetryEvent(telemetry)`, `FaultEvent(fault)`, `DiagnosticCompleteEvent(diagnostic, completed_at_ns)` and `StatsEvent(frames_processed)`. `ApplicationEvent` is their `Union`. Values stay unformatted.
+
+**Controllers** (`controllers/`):
+
+* `BaseController[ResultT]` (Feature 05) takes `ApplicationState`, `StatsService` and an `EventPublisher` by injection, and names its domain with `ClassVar event_type`. Its contract is the abstract `handle(result, message) -> ControllerResult`, called once per successfully decoded message. Each implementation validates the result first. A valid result updates state through `ApplicationState`, publishes one event and is counted with `StatsService.record_processed(event_type)` (`_complete`). An invalid one is counted with `record_rejected`, leaves state and output untouched and returns `REJECTED` with a reason (`_reject`). Service failures (state or publisher raising) are not expected input: they propagate, and nothing is published or counted. The base class has no type-based branching.
+* `ControllerResult(status, decoded, event=None, reason=None)` with `ControllerStatus` PROCESSED/REJECTED (`controllers/results.py`) is the explicit processing result. `ControllerRoute` returns it, so it is `DispatchResult.result` for the challenge routes.
+* Validation: `TelemetryController` checks that the module is known and that the CAN ID is `TELEMETRY_BASE_ID + module`. `FaultController` checks a known module and a `FaultCode` member. `DiagnosticController` checks for `completed_at_ns` (a message without it is incomplete), a known module, `result.message_id == message.message_id` and non-empty text. It publishes `DiagnosticCompleteEvent` with the transport's `completed_at_ns` and never reads a clock.
+* `ApplicationController` is not a `BaseController`: its contract is different. It is the transport's `TransportListener`, and `on_message` dispatches through an injected `dispatch` callable, logs unhandled messages at debug level and controller rejections at warning level (stderr). `on_frame(outcome)` counts every outcome except `IGNORED` and `None`. `report_stats_if_due()` publishes `StatsService.poll(clock())`. `run(poll_frame, keep_running)` is the receive loop: one poll and one stats check per iteration, so stats keep flowing on an idle bus because the receive times out every 0.5 s. `shutdown()` publishes the final stats. It never sees raw frames.
+
+**Services** (`services/`). Feature 06 (`feature-specs/06-services_and_output.md`) completed them:
+
+* `EventPublisher` is a concrete class: `register(consumer)` adds an `EventConsumer` (`on_event(event)`); registering the same consumer twice raises `ValueError`, and a non-consumer raises `TypeError`. `publish(event)` delivers the same event object, synchronously and in registration order, with no queue or thread. **Consumer failure policy:** a consumer raising an `Exception` is logged on stderr, delivery continues to the remaining consumers, and once all have been called `EventDeliveryError(event, failures)` is raised (first exception chained as `__cause__`), so a failure never stops other consumers and is never silent. `KeyboardInterrupt`/`SystemExit` are not caught. This is the only broad `except` in `src/`, and it re-raises. Controllers depend only on `publish`.
+* `ApplicationState` holds fixed slots per module: the latest `TelemetryResult`, the current `FaultResult` (`latest_fault`) and the latest diagnostic completion, stored as a `DiagnosticCompleteEvent` so its `completed_at_ns` is kept (`update_identification(result, completed_at_ns)`, `identification`, `diagnostic_completion`). It also keeps a `deque(maxlen=recent_fault_limit)` of recent faults. Every update is validated before commit (expected result type, `int` module in range, `FaultCode` member, identification ID `DIAGNOSTIC_BASE_ID + module`, non-empty text, non-negative `int` timestamp), so an invalid update raises and the last valid state stays. `snapshot()` returns a frozen `StateSnapshot` of tuples. No internal collection is exposed, and nothing grows with traffic.
+* `StatsService(report_interval_ns)` owns `frames_processed` (`record_frame()`), fixed per-domain counters (`record_processed`/`record_rejected`/`processed`/`rejected`, keyed by the telemetry, fault and diag_complete `EventType`s), `snapshot()` (a frozen `StatsSnapshot` with read-only mapping copies), `stats_event()` (the ADAPTER.md `StatsEvent`, `frames_processed` only) and `poll(now_ns)` (the first poll reports, then one report per interval).
+* **Single counting point for `frames_processed`:** `ApplicationController.on_frame` is the only caller of `record_frame`, once per received frame whose `FrameOutcome` is not `IGNORED`. The transport's framing map holds exactly 0x100–0x103, 0x1F0 and 0x6F0–0x6F3, so noise (0x200–0x2FF) is never counted. A diagnostic frame counts once even if its message is later abandoned, and completed messages, decoders and controllers never count frames.
+
+**Output** (`output/`). Both adapters implement `EventConsumer`. `main.build_output` picks exactly one per run, and it is the only consumer registered with the `EventPublisher`:
+
+* `GraderOutput(stream)` writes one line per event (`to_json_line`: `json.dumps(..., allow_nan=False)`, so a NaN/infinity raises instead of producing invalid JSON, and nothing is written for it) and flushes each one. Fields are ADAPTER.md's flat objects with a `type` field. The `event`/`data` shape in spec 06 §6.2 is explicitly a placeholder and is not used. `voltage` and `current` are rounded to 2 decimals, `temp_c` is an int, `can_id` is `f"{id:#x}"`, `string` is the exact received text and `ts_ns` is `completed_at_ns` unchanged.
+* `Dashboard(state, stream, refresh_interval_ns)` redraws in place with ANSI `ESC[H` / `ESC[K` / `ESC[J` (no curses). Events only trigger redraws, and the values come from one `ApplicationState.snapshot()` per redraw, so nothing is decoded. Stats events always redraw; other events redraw at most once per refresh interval. The final stats event at shutdown draws the final state. `format_dashboard(snapshot, frames_processed)` is pure and shows placeholders for missing data.
+
+**Composition and lifecycle** (`main.py`):
+
+1. Parse `--iface`, `--grader` and `--debug`, then `build_application_config` (adds `OutputConfig(mode, stats_interval_s, dashboard_refresh_s, recent_fault_limit)`).
+2. Build `SocketCanInterface`, then `CanTransport`.
+3. `build_application` builds the state, `StatsService`, one `EventPublisher` with the mode's single output consumer registered (`build_output`), the three controllers, `init_routes(...)` and `ApplicationController`, and adds the latter as the transport listener.
+4. `run`: open the bus, install a SIGTERM handler (`ShutdownRequest`) that stops the loop after the current receive, and run until Ctrl+C or SIGTERM. Then `stop()` publishes the final stats and closes the socket in `finally`. The socket is closed even if the final stats cannot be delivered (logged). A `CommunicationError` or `EventDeliveryError` exits with code 1, logged on stderr; stdout gets nothing but output events.
+
+**Dependency rules (checked by grep):** `communication` imports no controllers, routes or output. `transport` imports `communication.interface` but no output. `protocol` imports no controllers, output, routes or services. `controllers` import `routes.common.results` (a contract) but no domain routes or `routes_init`. `services` import no output. `output` imports `services` and `models` but no decoders, transport or communication. `models/application_event.py` imports only the protocol result models. Every module imports on its own with no cycles.
 
 ---
 
@@ -1078,81 +1189,65 @@ This is preferred for the current challenge because it provides:
 
 # 30. Proposed Project Structure
 
-The architecture can be represented in the project as:
+The project structure, as implemented after spec 04. `App/src/` is the source root, and `main.py` is the composition root:
 
 ```text
 deepsea-can-diagnostic/
 │
 ├── App/
 │   ├── src/                    (source root; imports are `from transport... import`)
+│   │   ├── main.py             (composition root and lifecycle, §22.1)
 │   │   │
-│   │   ├── main.py             (entry point)
-│   │   │
-│   │   ├── communication/
-│   │   │   ├── __init__.py
-│   │   │   ├── interface.py
-│   │   │   ├── frame.py            (raw struct can_frame → CanFrame)
-│   │   │   ├── rx_buffer.py        (not yet implemented)
-│   │   │   └── socketcan.py
-│   │   │
-│   │   ├── transport/
-│   │   │   ├── __init__.py
-│   │   │   ├── transport.py        (Transport interface)
-│   │   │   ├── can_transport.py    (single-frame + segmented framing map)
-│   │   │   ├── reassembler.py
-│   │   │   └── listener.py
-│   │   │
+│   │   ├── communication/      interface.py, frame.py (raw struct can_frame → CANFrame), socketcan.py
+│   │   │                       (rx_buffer.py not yet implemented)
+│   │   ├── transport/          transport.py (Transport, FrameOutcome, receive_from), can_transport.py,
+│   │   │                       reassembler.py, listener.py
 │   │   ├── protocol/
-│   │   │   ├── __init__.py
-│   │   │   ├── router.py
-│   │   │   ├── telemetry.py
-│   │   │   ├── fault.py
-│   │   │   └── diagnostic.py
-│   │   │
-│   │   ├── controller/
-│   │   │   ├── __init__.py
-│   │   │   └── controller.py
-│   │   │
-│   │   ├── services/
-│   │   │   ├── __init__.py
-│   │   │   ├── output.py
-│   │   │   ├── dashboard.py
-│   │   │   └── grader.py
-│   │   │
-│   │   ├── models/
-│   │   │   ├── __init__.py
-│   │   │   ├── can_frame.py
-│   │   │   ├── message.py
-│   │   │   ├── telemetry.py
-│   │   │   ├── fault.py
-│   │   │   └── diagnostic.py
-│   │   │
-│   │   └── config/
-│   │       ├── __init__.py
-│   │       ├── settings.py
-│   │       └── constants.py
+│   │   │   ├── common/         __init__.py (ProtocolDecodeError, shared validation)
+│   │   │   ├── telemetry/      decoder.py, models.py (TelemetryResult)
+│   │   │   ├── fault/          decoder.py, models.py (FaultCode, FaultResult)
+│   │   │   └── diagnostic/     decoder.py, models.py (DiagnosticResult)
+│   │   ├── routes/
+│   │   │   ├── common/         router.py (Base/Sub/RootRouter), results.py, controller_route.py
+│   │   │   ├── telemetry/      routes.py
+│   │   │   ├── fault/          routes.py
+│   │   │   ├── diagnostic/     routes.py
+│   │   │   └── routes_init.py
+│   │   ├── controllers/
+│   │   │   ├── base_controller.py
+│   │   │   ├── results.py      ControllerStatus, ControllerResult
+│   │   │   ├── application_controller.py
+│   │   │   ├── telemetry/      telemetry_controller.py
+│   │   │   ├── fault/          fault_controller.py
+│   │   │   └── diagnostic/     diagnostic_controller.py
+│   │   ├── services/           event_publisher.py, application_state.py, stats_service.py
+│   │   ├── output/             dashboard.py, grader.py
+│   │   ├── models/             can_frame.py, message.py, application_event.py
+│   │   └── config/             constants.py, settings.py
 │   │
 │   └── test/                   (unittest; top-level dir for discovery, not a package)
-│       ├── helpers.py          (frame builders, FakeCanSocket, RecordingListener)
-│       ├── unit/               (one component in isolation)
-│       │   ├── communication/
-│       │   ├── transport/
-│       │   ├── models/
-│       │   └── config/
-│       ├── integration/        (layers wired across a boundary, fake socket)
-│       │   └── communication_transport/
-│       └── e2e/                (live vcan0 + challenge generator; skipped off the Pi)
-│           └── live_bus/
+│       ├── helpers.py          (frame/message builders, FakeCanSocket, RecordingListener,
+│       │                        RecordingPublisher, RecordingController, FakeClock)
+│       ├── unit/               communication/, transport/, models/, config/, protocol/, routes/,
+│       │                       controllers/, services/, output/
+│       ├── integration/        communication_transport/, transport_protocol/,
+│       │                       application/ (main.build_application + main.run, both modes)
+│       └── e2e/live_bus/       (live vcan0 + challenge generator; skipped off the Pi)
 │
+├── Context/                    (specs and context files)
 ├── docs/
-│   ├── PROJECT_OVERVIEW.md
-│   ├── CODE_STANDARDS.md
-│   └── architecture-context.md
-│
 ├── README.md
 ├── .gitignore
 └── .gitattributes
 ```
+
+Differences from spec 04 §4's logical tree, kept on purpose (§10: "do not rewrite functioning … logic solely to match a preferred filename"):
+
+* Code lives under `App/src/`, and `main.py` sits there, not at the repo root (user decision, see the progress tracker).
+* `transport/can_transport.py` is kept next to the `transport.py` interface (§11.1).
+* `models/can_frame.py` is kept, because the frame model is shared by communication and transport.
+* `routes/common/controller_route.py` is an extra module. It holds the decoder → controller handler shared by the three domain routes, which keeps `router.py` free of controller imports.
+* Tests stay organised type first (`unit/`, `integration/`, `e2e/`), then by area (user decision), not `tests/<layer>/`.
 
 ---
 
