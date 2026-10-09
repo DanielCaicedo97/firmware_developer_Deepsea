@@ -65,6 +65,25 @@ python3 ~/challenge/can_generator/generator.py --iface vcan0 --duration 90
 
 Use a longer duration (for example `600`) to watch memory stay flat over many abandonment cycles.
 
+### Monitor memory and CPU
+
+Start the tool and the generator first, then open a third terminal. Each command below tracks both processes.
+
+```bash
+# Interactive view (RES = resident memory)
+htop -p $(pgrep -d, -f "[m]ain.py --iface vcan0|[g]enerator.py --iface vcan0")
+
+# Plain view, refreshed every 2 s (RSS in KB)
+watch -n 2 'ps -o pid,etime,rss,%mem,%cpu,cmd -p $(pgrep -d, -f "[m]ain.py --iface vcan0|[g]enerator.py --iface vcan0")'
+```
+
+* **What to expect:** the tool's resident memory rises slightly during the first minute while Python warms up, then stays flat until the end of the run. If it kept climbing for the whole run, something would be growing with each abandoned message.
+* **`htop` takes its process list once** at startup. Start both processes before opening it. `watch` searches again on every refresh.
+* **The brackets** (`[m]ain.py`, `[g]enerator.py`) stop `pgrep` from matching the `watch` command itself, whose own command line contains the same text.
+* The generator disappears from the list when its run ends. That is expected.
+
+For what `--debug` logs and how to read it, see [`docs/debug-mode.md`](./docs/debug-mode.md).
+
 ---
 
 ## 🖥️ Output Modes
